@@ -6,7 +6,7 @@ various data related to electricity usage and tariffs.
 
 import logging
 import json
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple, Union, cast
 import asyncio
 import jwt
@@ -704,13 +704,19 @@ class TokenManager:
                 # Wait for the configured refresh interval
                 await asyncio.sleep(TOKEN_AUTO_REFRESH_INTERVAL)
 
-                _LOGGER.info("Performing scheduled token refresh")
+                _LOGGER.debug("Performing scheduled token refresh")
 
                 if self._refresh_callback is not None:
-                    # Force token refresh by temporarily invalidating the token expiry
-                    self._expiry = 0  # Set to expired
-                    await self._refresh_callback()
-                    _LOGGER.debug("Scheduled token refresh completed")
+                    try:
+                        # Force token refresh by temporarily invalidating the token expiry
+                        self._expiry = 0  # Set to expired
+                        await self._refresh_callback()
+                        _LOGGER.debug("Scheduled token refresh completed")
+                    except Exception as refresh_err:
+                        _LOGGER.warning(
+                            "Scheduled token refresh failed (will retry next interval): %s",
+                            refresh_err,
+                        )
                 else:
                     _LOGGER.warning(
                         "No refresh callback set, cannot auto-refresh token"
@@ -727,7 +733,7 @@ class TokenManager:
         if not self._token or not self._expiry:
             return False
 
-        now = datetime.utcnow().timestamp()
+        now = datetime.now(timezone.utc).timestamp()
 
         # Token is valid if it has at least TOKEN_REFRESH_MARGIN seconds left before expiry
         valid = now < (self._expiry - TOKEN_REFRESH_MARGIN)
@@ -748,7 +754,7 @@ class TokenManager:
         if expiry:
             # Use expiry directly if provided
             self._expiry = expiry
-            now = datetime.utcnow().timestamp()
+            now = datetime.now(timezone.utc).timestamp()
             token_lifetime = self._expiry - now if self._expiry else 0
             _LOGGER.debug(
                 "Token set with explicit expiry - valid for %s seconds",
@@ -759,7 +765,7 @@ class TokenManager:
             try:
                 decoded = jwt.decode(token, options={"verify_signature": False})
                 self._expiry = decoded.get("exp")
-                now = datetime.utcnow().timestamp()
+                now = datetime.now(timezone.utc).timestamp()
                 token_lifetime = self._expiry - now if self._expiry else 0
                 _LOGGER.debug(
                     "Token set with decoded expiry - valid for %s seconds",
@@ -767,7 +773,7 @@ class TokenManager:
                 )
             except Exception as e:
                 # Fallback: If token decoding fails, set expiry to TOKEN_AUTO_REFRESH_INTERVAL from now
-                now = datetime.utcnow().timestamp()
+                now = datetime.now(timezone.utc).timestamp()
                 self._expiry = now + TOKEN_AUTO_REFRESH_INTERVAL
                 _LOGGER.warning(
                     "Failed to decode token expiry: %s. Setting fallback expiry to %s minutes",
@@ -993,8 +999,25 @@ class OctopusGermany:
             response = await client.execute_async(query=ACCOUNT_DISCOVERY_QUERY)
             _LOGGER.debug("Fetch accounts with initial data response: %s", response)
 
-            if "data" in response and "viewer" in response["data"]:
-                accounts = response["data"]["viewer"]["accounts"]
+            if response is None:
+                _LOGGER.warning("API returned None response for account discovery")
+                return None
+
+            if "errors" in response:
+                _LOGGER.warning(
+                    "GraphQL errors in account discovery response: %s",
+                    response["errors"],
+                )
+                # Still try to extract data if partially available
+                if "data" not in response:
+                    return None
+
+            if "data" in response and response["data"] and "viewer" in response["data"]:
+                viewer = response["data"]["viewer"]
+                if not viewer or "accounts" not in viewer:
+                    _LOGGER.warning("No viewer or accounts in response")
+                    return None
+                accounts = viewer["accounts"]
                 if not accounts:
                     _LOGGER.error("No accounts found")
                     return None
@@ -1023,7 +1046,7 @@ class OctopusGermany:
         return await self.fetch_accounts_with_initial_data()
 
     # Comprehensive data fetch in a single query
-    async def fetch_all_data(self, account_number: str):
+    async def fetch_all_data(self, account_number: str, _token_retry: int = 0):
         """Fetch all data for an account including devices, dispatches and account details.
 
         This comprehensive query consolidates multiple separate queries into one
@@ -1316,12 +1339,15 @@ class OctopusGermany:
                         for error in other_errors:
                             error_code = error.get("extensions", {}).get("errorCode")
                             if error_code == "KT-CT-1124":  # JWT expired
+                                if _token_retry >= 2:
+                                    _LOGGER.error("Token retry limit reached in fetch_all_data (critical errors path)")
+                                    return None
                                 _LOGGER.warning("Token expired, refreshing...")
                                 self._token_manager.clear()
                                 success = await self.login()
                                 if success:
                                     # Retry with new token
-                                    return await self.fetch_all_data(account_number)
+                                    return await self.fetch_all_data(account_number, _token_retry=_token_retry + 1)
 
                 # Fetch electricity smart meter readings if property data is available
                 try:
@@ -1351,25 +1377,29 @@ class OctopusGermany:
                                 # Mark as explored to prevent repeated exploration
                                 self._schema_explored = True
 
-                            # Get multiple dates for testing: today, yesterday, day before yesterday
+                            # Get dates for testing, prioritizing cached last working date
                             from datetime import date, timedelta
 
                             today = date.today()
                             yesterday = today - timedelta(days=1)
                             day_before_yesterday = today - timedelta(days=2)
-                            week_ago = today - timedelta(days=7)
-                            month_ago = today - timedelta(days=30)
 
-                            test_dates = [
+                            # Build test dates, prioritizing last working date if still recent
+                            test_dates = []
+                            last_working = getattr(self, "_last_working_sm_date", None)
+                            if last_working and last_working >= day_before_yesterday.isoformat():
+                                test_dates.append((last_working, "cached_last_working"))
+
+                            for candidate in [
                                 (today.isoformat(), "today"),
                                 (yesterday.isoformat(), "yesterday"),
-                                (
-                                    day_before_yesterday.isoformat(),
-                                    "day_before_yesterday",
-                                ),
-                                (week_ago.isoformat(), "week_ago"),
-                                (month_ago.isoformat(), "month_ago"),
-                            ]
+                                (day_before_yesterday.isoformat(), "day_before_yesterday"),
+                            ]:
+                                if candidate[0] not in [d[0] for d in test_dates]:
+                                    test_dates.append(candidate)
+
+                            # Limit to 3 attempts max
+                            test_dates = test_dates[:3]
 
                             _LOGGER.info(
                                 "Testing smart meter readings for multiple dates: %s",
@@ -1400,6 +1430,8 @@ class OctopusGermany:
                                 if readings:
                                     smart_meter_readings = readings
                                     successful_date = (date_str, date_label)
+                                    # Cache the working date for next cycle
+                                    self._last_working_sm_date = date_str
                                     _LOGGER.info(
                                         "Successfully fetched %d smart meter readings for %s (%s)",
                                         len(readings),
@@ -1483,12 +1515,15 @@ class OctopusGermany:
 
                 # Check if token expired error
                 if error_code == "KT-CT-1124":  # JWT expired
+                    if _token_retry >= 2:
+                        _LOGGER.error("Token retry limit reached in fetch_all_data (no-data path)")
+                        return None
                     _LOGGER.warning("Token expired, refreshing...")
                     self._token_manager.clear()
                     success = await self.login()
                     if success:
                         # Retry with new token
-                        return await self.fetch_all_data(account_number)
+                        return await self.fetch_all_data(account_number, _token_retry=_token_retry + 1)
 
                 _LOGGER.error(
                     "API returned critical errors with no data: %s",
@@ -1503,7 +1538,7 @@ class OctopusGermany:
             _LOGGER.error("Error fetching all data: %s", e)
             return None
 
-    async def fetch_charging_sessions(self, account_number: str):
+    async def fetch_charging_sessions(self, account_number: str, _token_retry: int = 0):
         """Fetch charging sessions for smart charging rewards tracking.
 
         Returns:
@@ -1553,12 +1588,15 @@ class OctopusGermany:
 
                 # Check if token expired error
                 if error_code == "KT-CT-1124":  # JWT expired
+                    if _token_retry >= 2:
+                        _LOGGER.error("Token retry limit reached in fetch_charging_sessions")
+                        return None
                     _LOGGER.warning("Token expired, refreshing...")
                     self._token_manager.clear()
                     success = await self.login()
                     if success:
                         # Retry with new token
-                        return await self.fetch_charging_sessions(account_number)
+                        return await self.fetch_charging_sessions(account_number, _token_retry=_token_retry + 1)
 
                 _LOGGER.info(
                     "No charging sessions available for account %s (may not have SmartFlex devices): %s",
@@ -1578,7 +1616,7 @@ class OctopusGermany:
             )
             return None  # None signals error - caller should use cached data
 
-    async def change_device_suspension(self, device_id: str, action: str):
+    async def change_device_suspension(self, device_id: str, action: str, _token_retry: int = 0):
         """Change device suspension state."""
         if not await self.ensure_token():
             _LOGGER.error("Failed to ensure valid token for change_device_suspension")
@@ -1608,6 +1646,9 @@ class OctopusGermany:
 
                 # Check if token expired error
                 if error_code == "KT-CT-1124":  # JWT expired
+                    if _token_retry >= 2:
+                        _LOGGER.error("Token retry limit reached in change_device_suspension")
+                        return None
                     _LOGGER.warning(
                         "Token expired during device suspension change, refreshing..."
                     )
@@ -1615,7 +1656,7 @@ class OctopusGermany:
                     success = await self.login()
                     if success:
                         # Retry with new token
-                        return await self.change_device_suspension(device_id, action)
+                        return await self.change_device_suspension(device_id, action, _token_retry=_token_retry + 1)
 
                 _LOGGER.error("API returned errors: %s", response["errors"])
                 return None
@@ -1632,6 +1673,7 @@ class OctopusGermany:
         device_id: str,
         target_percentage: int,
         target_time: str,
+        _token_retry: int = 0,
     ) -> bool:
         """Set device charging preferences using the new setDevicePreferences API.
 
@@ -1736,6 +1778,9 @@ class OctopusGermany:
 
                 # Check if token expired error
                 if error_code == "KT-CT-1124":  # JWT expired
+                    if _token_retry >= 2:
+                        _LOGGER.error("Token retry limit reached in set_device_preferences")
+                        return False
                     _LOGGER.warning(
                         "Token expired during setting device preferences, refreshing..."
                     )
@@ -1747,6 +1792,7 @@ class OctopusGermany:
                             device_id,
                             target_percentage,
                             target_time,
+                            _token_retry=_token_retry + 1,
                         )
 
                 return False
@@ -1756,7 +1802,7 @@ class OctopusGermany:
             _LOGGER.error("Error setting device preferences: %s", e)
             return False
 
-    async def get_vehicle_devices(self, account_number: str):
+    async def get_vehicle_devices(self, account_number: str, _token_retry: int = 0):
         """Get vehicle device details with preference settings.
 
         Args:
@@ -1791,12 +1837,15 @@ class OctopusGermany:
 
                 # Check if token expired error
                 if error_code == "KT-CT-1124":  # JWT expired
+                    if _token_retry >= 2:
+                        _LOGGER.error("Token retry limit reached in get_vehicle_devices")
+                        return None
                     _LOGGER.warning("Token expired, refreshing...")
                     self._token_manager.clear()
                     success = await self.login()
                     if success:
                         # Retry with new token
-                        return await self.get_vehicle_devices(account_number)
+                        return await self.get_vehicle_devices(account_number, _token_retry=_token_retry + 1)
 
                 _LOGGER.error(
                     "GraphQL errors in vehicle devices response: %s",
@@ -1827,7 +1876,7 @@ class OctopusGermany:
             _LOGGER.error("Error fetching vehicle devices: %s", e)
             return None
 
-    async def fetch_flex_planned_dispatches(self, device_id: str):
+    async def fetch_flex_planned_dispatches(self, device_id: str, _token_retry: int = 0):
         """Fetch planned dispatches for a specific device using the new flexPlannedDispatches API.
 
         Args:
@@ -1874,12 +1923,15 @@ class OctopusGermany:
 
                 # Check if token expired error
                 if error_code == "KT-CT-1124":  # JWT expired
+                    if _token_retry >= 2:
+                        _LOGGER.error("Token retry limit reached in fetch_flex_planned_dispatches")
+                        return None
                     _LOGGER.warning("Token expired, refreshing...")
                     self._token_manager.clear()
                     success = await self.login()
                     if success:
                         # Retry with new token
-                        return await self.fetch_flex_planned_dispatches(device_id)
+                        return await self.fetch_flex_planned_dispatches(device_id, _token_retry=_token_retry + 1)
 
                 # Log but don't fail for non-critical errors (device might not support flex dispatches)
                 if error_code == "KT-CT-4301":  # Resource not found

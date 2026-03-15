@@ -11,6 +11,7 @@ import inspect
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
+from homeassistant.exceptions import ConfigEntryNotReady
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 from homeassistant.util.dt import utcnow, as_utc, parse_datetime
@@ -61,7 +62,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # Log in only once and reuse the token through the global token manager
     if not await api.login():
         _LOGGER.error("Failed to authenticate with Octopus Germany API")
-        return False
+        raise ConfigEntryNotReady("Failed to authenticate with Octopus Germany API")
 
     # Ensure DOMAIN is initialized in hass.data
     if DOMAIN not in hass.data:
@@ -102,25 +103,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         """Fetch data from API with improved error handling for all accounts."""
         current_time = datetime.now()
 
-        # Add throttling to prevent too frequent API calls
-        # Store last successful API call time on the function object
-        if not hasattr(async_update_data, "last_api_call"):
-            async_update_data.last_api_call = datetime.now() - timedelta(
-                minutes=UPDATE_INTERVAL
-            )
-
-        # Calculate time since last API call
-        time_since_last_call = (
-            current_time - async_update_data.last_api_call
-        ).total_seconds()
-        min_interval = (
-            UPDATE_INTERVAL * 60 * 0.9
-        )  # 90% of the update interval in seconds
-
-        # Get simplified caller information instead of full stack trace
-        caller_info = "Unknown caller"
         if DEBUG_ENABLED:
-            # Get the caller's frame (2 frames up from current)
+            # Get simplified caller information instead of full stack trace
+            caller_info = "Unknown caller"
             try:
                 frame = inspect.currentframe()
                 if frame:
@@ -128,7 +113,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                         frame.f_back.f_back
                     )  # Go up two frames to find the actual caller
                     if frame:
-                        # Extract useful caller information
                         caller_module = frame.f_globals.get(
                             "__name__", "unknown_module"
                         )
@@ -139,25 +123,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             except Exception:
                 caller_info = "Error getting caller info"
 
-        _LOGGER.debug(
-            "Coordinator update called at %s (Update interval: %s minutes, Time since last API call: %.1f seconds, Caller: %s)",
-            current_time.strftime("%H:%M:%S"),
-            UPDATE_INTERVAL,
-            time_since_last_call,
-            caller_info,
-        )
-
-        # If called too soon after last API call, return cached data
-        if (
-            time_since_last_call < min_interval
-            and hasattr(coordinator, "data")
-            and coordinator.data
-        ):
             _LOGGER.debug(
-                "Throttling API call - returning cached data from %s",
-                async_update_data.last_api_call.strftime("%H:%M:%S"),
+                "Coordinator update called at %s (Update interval: %s minutes, Caller: %s)",
+                current_time.strftime("%H:%M:%S"),
+                UPDATE_INTERVAL,
+                caller_info,
             )
-            return coordinator.data
 
         try:
             # Let the API class handle token validation
@@ -186,10 +157,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                         "Error fetching data for account %s: %s", account_num, e
                     )
                     continue
-
-            # Update last API call timestamp only on successful calls
-            if all_accounts_data:
-                async_update_data.last_api_call = datetime.now()
 
             if not all_accounts_data:
                 _LOGGER.error(
@@ -702,7 +669,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     "code": "TEST_PRODUCT",
                     "description": "Test Product for debugging",
                     "name": "Test Product",
-                    "grossRate": "30",  # 30 cents as a reasonable default
+                    "grossRate": None,  # No fallback price - show unknown instead of wrong value
                     "type": "Simple",
                     "validFrom": None,
                     "validTo": None,
@@ -1669,6 +1636,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload a config entry."""
+
+    # Cancel the API's auto-refresh task before unloading
+    entry_data = hass.data[DOMAIN].get(entry.entry_id, {})
+    api = entry_data.get("api")
+    if api and hasattr(api, "_token_manager") and api._token_manager:
+        refresh_task = getattr(api._token_manager, "_refresh_task", None)
+        if refresh_task and not refresh_task.done():
+            refresh_task.cancel()
+            _LOGGER.debug("Cancelled token auto-refresh task during unload")
 
     if unload_ok := await hass.config_entries.async_unload_platforms(entry, PLATFORMS):
         hass.data[DOMAIN].pop(entry.entry_id)
