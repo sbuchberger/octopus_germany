@@ -669,7 +669,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     "code": "TEST_PRODUCT",
                     "description": "Test Product for debugging",
                     "name": "Test Product",
-                    "grossRate": None,  # No fallback price - show unknown instead of wrong value
+                    "grossRate": "0",  # Safe fallback - float("0") won't crash
                     "type": "Simple",
                     "validFrom": None,
                     "validTo": None,
