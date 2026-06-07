@@ -1,7 +1,9 @@
 {
   "domain": "octopus_germany",
   "name": "Octopus Germany",
-  "after_dependencies": ["recorder"],
+  "after_dependencies": [
+    "recorder"
+  ],
   "codeowners": [
     "@thecem"
   ],
@@ -13,5 +15,5 @@
   "requirements": [
     "python-graphql-client>=0.4.3"
   ],
-  "version": "0.0.87"
+  "version": "0.0.89"
 }
