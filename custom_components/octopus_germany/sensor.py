@@ -17,6 +17,7 @@ from homeassistant.components.sensor import (
 )
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import (
+    PERCENTAGE,
     STATE_UNKNOWN,
     STATE_UNAVAILABLE,
     UnitOfEnergy,
@@ -269,6 +270,20 @@ async def async_setup_entry(
                             OctopusDeviceStatusSensor(acc_num, coordinator, device_id)
                         )
 
+                        # Create extra vehicle data sensors for each electric vehicle.
+                        if device.get("deviceType") == "ELECTRIC_VEHICLES":
+                            entities.append(
+                                OctopusVehicleLastSessionSocSensor(
+                                    acc_num, coordinator, device_id
+                                )
+                            )
+
+                            entities.append(
+                                OctopusVehicleBatterySizeSensor(
+                                    acc_num, coordinator, device_id
+                                )
+                            )
+
             # Erzeuge für jedes Gerät eine eigene Smart Charging Sessions Entität
             charging_sessions = account_data.get("charging_sessions")
             device_sessions = {}
@@ -330,7 +345,7 @@ async def async_setup_entry(
         _LOGGER.warning("No entities to add for any account")
 
 
-class OctopusElectricityPriceSensor(CoordinatorEntity, SensorEntity, RestoreEntity):
+class OctopusElectricityPriceSensor(CoordinatorEntity, SensorEntity):
     """Sensor for Octopus Germany electricity price."""
 
     def __init__(self, account_number, coordinator) -> None:
@@ -345,23 +360,9 @@ class OctopusElectricityPriceSensor(CoordinatorEntity, SensorEntity, RestoreEnti
         self._attr_state_class = SensorStateClass.TOTAL
         self._attr_has_entity_name = False
         self._attributes = {}
-        self._restored_state = None
 
         # Initialize attributes right after creation
         self._update_attributes()
-
-    async def async_added_to_hass(self) -> None:
-        """Restore last known state on startup."""
-        await super().async_added_to_hass()
-        if (state := await self.async_get_last_state()) is not None:
-            if state.state not in (STATE_UNAVAILABLE, STATE_UNKNOWN):
-                try:
-                    self._restored_state = float(state.state)
-                except (ValueError, TypeError):
-                    pass
-                if state.attributes:
-                    self._attributes.update(state.attributes)
-        _LOGGER.debug("Restored electricity price state: %s", self._restored_state)
 
     def _parse_time(self, time_str: str) -> time:
         """Parse time string in HH:MM:SS format to time object."""
@@ -496,15 +497,15 @@ class OctopusElectricityPriceSensor(CoordinatorEntity, SensorEntity, RestoreEnti
             or not isinstance(self.coordinator.data, dict)
             or self._account_number not in self.coordinator.data
         ):
-            _LOGGER.debug("No coordinator data yet for price sensor, using restored state")
-            return self._restored_state
+            _LOGGER.warning("No valid coordinator data found for price sensor")
+            return None
 
         account_data = self.coordinator.data[self._account_number]
         products = account_data.get("products", [])
 
         if not products:
             _LOGGER.warning("No products found in coordinator data")
-            return self._restored_state
+            return None
 
         # Find the current valid product based on validity dates
         now = datetime.now().isoformat()
@@ -581,7 +582,7 @@ class OctopusElectricityPriceSensor(CoordinatorEntity, SensorEntity, RestoreEnti
                 )
 
         _LOGGER.warning("No valid product found for current date")
-        return self._restored_state
+        return None
 
     def _update_attributes(self) -> None:
         """Update the internal attributes dictionary."""
@@ -844,14 +845,13 @@ class OctopusElectricityPriceSensor(CoordinatorEntity, SensorEntity, RestoreEnti
 
     @property
     def available(self) -> bool:
-        """Return True if entity is available (coordinator data OR restored state)."""
-        coordinator_available = (
+        """Return True if entity is available."""
+        return (
             self.coordinator is not None
             and self.coordinator.last_update_success
             and isinstance(self.coordinator.data, dict)
             and self._account_number in self.coordinator.data
         )
-        return coordinator_available or self._restored_state is not None
 
     @property
     def device_info(self) -> DeviceInfo:
@@ -903,7 +903,7 @@ class OctopusGasBalanceSensor(CoordinatorEntity, SensorEntity):
         return get_account_device_info(self._account_number)
 
 
-class OctopusElectricityBalanceSensor(CoordinatorEntity, SensorEntity, RestoreEntity):
+class OctopusElectricityBalanceSensor(CoordinatorEntity, SensorEntity):
     """Sensor for Octopus Germany electricity balance."""
 
     def __init__(self, account_number, coordinator) -> None:
@@ -917,18 +917,6 @@ class OctopusElectricityBalanceSensor(CoordinatorEntity, SensorEntity, RestoreEn
         self._attr_native_unit_of_measurement = "€"
         self._attr_state_class = SensorStateClass.TOTAL
         self._attr_has_entity_name = False
-        self._restored_state = None
-
-    async def async_added_to_hass(self) -> None:
-        """Restore last known state on startup."""
-        await super().async_added_to_hass()
-        if (state := await self.async_get_last_state()) is not None:
-            if state.state not in (STATE_UNAVAILABLE, STATE_UNKNOWN):
-                try:
-                    self._restored_state = float(state.state)
-                except (ValueError, TypeError):
-                    pass
-        _LOGGER.debug("Restored electricity balance state: %s", self._restored_state)
 
     @property
     def native_value(self) -> float:
@@ -938,21 +926,20 @@ class OctopusElectricityBalanceSensor(CoordinatorEntity, SensorEntity, RestoreEn
             or not isinstance(self.coordinator.data, dict)
             or self._account_number not in self.coordinator.data
         ):
-            return self._restored_state
+            return None
 
         account_data = self.coordinator.data[self._account_number]
         return account_data.get("electricity_balance", 0.0)
 
     @property
     def available(self) -> bool:
-        """Return True if entity is available (coordinator data OR restored state)."""
-        coordinator_available = (
+        """Return True if entity is available."""
+        return (
             self.coordinator is not None
             and self.coordinator.last_update_success
             and isinstance(self.coordinator.data, dict)
             and self._account_number in self.coordinator.data
         )
-        return coordinator_available or self._restored_state is not None
 
     @property
     def device_info(self) -> DeviceInfo:
@@ -1549,7 +1536,7 @@ class OctopusGasLatestReadingSensor(CoordinatorEntity, SensorEntity):
         return get_account_device_info(self._account_number)
 
 
-class OctopusElectricityLatestReadingSensor(CoordinatorEntity, SensorEntity, RestoreEntity):
+class OctopusElectricityLatestReadingSensor(CoordinatorEntity, SensorEntity):
     """Sensor for Octopus Germany latest electricity meter reading."""
 
     def __init__(self, account_number, coordinator) -> None:
@@ -1563,23 +1550,9 @@ class OctopusElectricityLatestReadingSensor(CoordinatorEntity, SensorEntity, Res
         self._attr_state_class = SensorStateClass.TOTAL_INCREASING
         self._attr_has_entity_name = False
         self._attributes = {}
-        self._restored_state = None
 
         # Initialize attributes right after creation
         self._update_attributes()
-
-    async def async_added_to_hass(self) -> None:
-        """Restore last known state on startup."""
-        await super().async_added_to_hass()
-        if (state := await self.async_get_last_state()) is not None:
-            if state.state not in (STATE_UNAVAILABLE, STATE_UNKNOWN):
-                try:
-                    self._restored_state = float(state.state)
-                except (ValueError, TypeError):
-                    pass
-                if state.attributes:
-                    self._attributes.update(state.attributes)
-        _LOGGER.debug("Restored electricity latest reading state: %s", self._restored_state)
 
     @property
     def native_value(self) -> float | None:
@@ -1589,7 +1562,7 @@ class OctopusElectricityLatestReadingSensor(CoordinatorEntity, SensorEntity, Res
             or not isinstance(self.coordinator.data, dict)
             or self._account_number not in self.coordinator.data
         ):
-            return self._restored_state
+            return None
 
         account_data = self.coordinator.data[self._account_number]
         electricity_reading = account_data.get("electricity_latest_reading")
@@ -1604,7 +1577,7 @@ class OctopusElectricityLatestReadingSensor(CoordinatorEntity, SensorEntity, Res
                     "Invalid electricity meter reading value: %s", reading_value
                 )
 
-        return self._restored_state
+        return None
 
     @property
     def native_unit_of_measurement(self) -> str | None:
@@ -1688,8 +1661,8 @@ class OctopusElectricityLatestReadingSensor(CoordinatorEntity, SensorEntity, Res
 
     @property
     def available(self) -> bool:
-        """Return True if entity is available (coordinator data OR restored state)."""
-        coordinator_available = (
+        """Return True if entity is available."""
+        return (
             self.coordinator is not None
             and self.coordinator.last_update_success
             and isinstance(self.coordinator.data, dict)
@@ -1699,7 +1672,6 @@ class OctopusElectricityLatestReadingSensor(CoordinatorEntity, SensorEntity, Res
             )
             is not None
         )
-        return coordinator_available or self._restored_state is not None
 
     @property
     def device_info(self) -> DeviceInfo:
@@ -2134,6 +2106,221 @@ class OctopusDeviceStatusSensor(CoordinatorEntity, SensorEntity):
         return get_account_device_info(self._account_number)
 
 
+class OctopusVehicleDataSensor(CoordinatorEntity, SensorEntity):
+    """Base sensor for per-vehicle metrics."""
+
+    _metric_name = "Metric"
+    _metric_unique_id = "metric"
+    _metric_icon = "mdi:car-electric"
+    _metric_device_class = None
+    _metric_unit = None
+
+    def __init__(self, account_number, coordinator, device_id: str) -> None:
+        """Initialize a vehicle data sensor."""
+        super().__init__(coordinator)
+
+        self._account_number = account_number
+        self._device_id = device_id
+        self._device_name = self._resolve_device_name()
+        norm_name = self._device_name.lower().replace(" ", "_")
+        for ch in [
+            "/",
+            "\\",
+            ",",
+            ".",
+            ":",
+            ";",
+            "|",
+            "[",
+            "]",
+            "{",
+            "}",
+            "(",
+            ")",
+            "'",
+            '"',
+            "#",
+            "?",
+            "!",
+            "@",
+            "=",
+            "+",
+            "*",
+            "%",
+            "&",
+            "<",
+            ">",
+        ]:
+            norm_name = norm_name.replace(ch, "_")
+
+        self._attr_name = (
+            f"Octopus {account_number} {self._device_name} {self._metric_name}"
+        )
+        self._attr_unique_id = (
+            f"octopus_{account_number}_{norm_name}_{self._metric_unique_id}"
+        )
+        self._attr_has_entity_name = False
+        self._attr_icon = self._metric_icon
+        self._attr_device_class = self._metric_device_class
+        self._attr_native_unit_of_measurement = self._metric_unit
+        self._attributes = {}
+
+    def _resolve_device_name(self) -> str:
+        """Resolve the current device name from coordinator data."""
+        device = self._get_device_data()
+        if device:
+            return device.get("name", f"Device_{self._device_id}")
+        return f"Device_{self._device_id}"
+
+    def _get_device_data(self) -> dict | None:
+        """Get the current device payload for this sensor."""
+        if (
+            not self.coordinator.data
+            or not isinstance(self.coordinator.data, dict)
+            or self._account_number not in self.coordinator.data
+        ):
+            return None
+
+        account_data = self.coordinator.data[self._account_number]
+        devices = account_data.get("devices")
+        if not isinstance(devices, list):
+            devices = []
+
+        for device in devices:
+            if device.get("id") == self._device_id:
+                return device
+        return None
+
+    def _get_latest_session(self) -> dict | None:
+        """Return the latest charging session for this device."""
+        if (
+            not self.coordinator.data
+            or not isinstance(self.coordinator.data, dict)
+            or self._account_number not in self.coordinator.data
+        ):
+            return None
+
+        account_data = self.coordinator.data[self._account_number]
+        sessions = account_data.get("charging_sessions")
+        if not isinstance(sessions, list):
+            return None
+
+        device_sessions = [
+            session
+            for session in sessions
+            if isinstance(session, dict) and session.get("device_id") == self._device_id
+        ]
+
+        if not device_sessions:
+            return None
+
+        return max(device_sessions, key=lambda s: s.get("start") or "")
+
+    @staticmethod
+    def _to_float(value: Any) -> float | None:
+        """Convert a value to float when possible."""
+        if value is None:
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _get_metric_value(self) -> Any:
+        """Return the concrete metric value for subclasses."""
+        raise NotImplementedError
+
+    @property
+    def native_value(self) -> Any:
+        """Return the metric value."""
+        return self._get_metric_value()
+
+    @property
+    def available(self) -> bool:
+        """Return True if entity is available."""
+        return (
+            self.coordinator is not None
+            and self.coordinator.last_update_success
+            and isinstance(self.coordinator.data, dict)
+            and self._account_number in self.coordinator.data
+            and self._get_device_data() is not None
+            and self.native_value is not None
+        )
+
+    @property
+    def extra_state_attributes(self) -> Dict[str, Any]:
+        """Return additional state attributes for the sensor."""
+        latest_session = self._get_latest_session() or {}
+        return {
+            "device_id": self._device_id,
+            "device_name": self._resolve_device_name(),
+            "account_number": self._account_number,
+            "latest_session_start": latest_session.get("start"),
+            "latest_session_end": latest_session.get("end"),
+            "last_updated": datetime.now().isoformat(),
+        }
+
+    @property
+    def device_info(self) -> DeviceInfo:
+        """Return device information."""
+        return get_device_specific_device_info(
+            self.coordinator.data, self._account_number, self._device_id
+        )
+
+
+class OctopusVehicleLastSessionSocSensor(OctopusVehicleDataSensor):
+    """Sensor for last known vehicle SoC from charging sessions."""
+
+    _metric_name = "SoC"
+    _metric_unique_id = "soc"
+    _metric_icon = "mdi:battery"
+    _metric_device_class = SensorDeviceClass.BATTERY
+    _metric_unit = PERCENTAGE
+
+    def _get_metric_value(self) -> float | None:
+        """Return latest SoC for this vehicle.
+
+        Prefer live SoC from device status and fall back to last charging session.
+        """
+        device = self._get_device_data()
+        if device:
+            status = device.get("status", {}) or {}
+            soc_reading = status.get("stateOfCharge")
+            if isinstance(soc_reading, dict):
+                live_soc = self._to_float(soc_reading.get("value"))
+            else:
+                live_soc = self._to_float(soc_reading)
+            if live_soc is not None:
+                return live_soc
+
+        latest_session = self._get_latest_session()
+        if not latest_session:
+            return None
+
+        value = latest_session.get(
+            "stateOfChargeFinal", latest_session.get("soc_final")
+        )
+        return self._to_float(value)
+
+
+class OctopusVehicleBatterySizeSensor(OctopusVehicleDataSensor):
+    """Sensor for EV battery size in kWh."""
+
+    _metric_name = "Battery Size"
+    _metric_unique_id = "battery_size"
+    _metric_icon = "mdi:car-electric"
+    _metric_unit = UnitOfEnergy.KILO_WATT_HOUR
+
+    def _get_metric_value(self) -> float | None:
+        """Return battery size for this vehicle."""
+        device = self._get_device_data()
+        if not device:
+            return None
+
+        vehicle_variant = device.get("vehicleVariant", {}) or {}
+        return self._to_float(vehicle_variant.get("batterySize"))
+
+
 class OctopusElectricitySmartMeterReadingsSensor(
     CoordinatorEntity, SensorEntity, RestoreEntity
 ):
@@ -2216,7 +2403,7 @@ class OctopusElectricitySmartMeterReadingsSensor(
                         # Skip invalid values
                         continue
                 return round(total_consumption, 3)
-        return self._state
+        return None
 
     @property
     def last_reset(self) -> datetime | None:
@@ -2319,14 +2506,13 @@ class OctopusElectricitySmartMeterReadingsSensor(
 
     @property
     def available(self) -> bool:
-        """Return True if entity is available (coordinator data OR restored state)."""
-        coordinator_available = (
+        """Return True if entity is available."""
+        return (
             self.coordinator is not None
             and self.coordinator.last_update_success
             and isinstance(self.coordinator.data, dict)
             and self._account_number in self.coordinator.data
         )
-        return coordinator_available or self._state is not None
 
     async def async_added_to_hass(self) -> None:
         """Call when entity about to be added to hass."""
