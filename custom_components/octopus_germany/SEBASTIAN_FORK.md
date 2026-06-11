@@ -14,3 +14,10 @@ Production deltas:
 - Point manifest documentation/issue links at the Sebastian fork for provenance.
 
 Do not blindly overwrite this package from upstream HACS without re-applying these production deltas.
+## sebastian-stable-v0.0.96-1 (2026-06-11)
+
+- Based on Sebastian stable v0.0.95 fork.
+- Incorporated upstream v0.0.96 service response registration (`SupportsResponse.ONLY`) and service description/doc update.
+- Preserved production safety flags: `UPDATE_INTERVAL=15`, `EXPLORE_SCHEMA_ONCE=False`, `DEBUG_ENABLED=False`.
+- Preserved Python 3 syntax fixes for multi-exception handlers; upstream v0.0.96 still contains invalid `except ValueError, TypeError` syntax in `sensor.py`.
+
